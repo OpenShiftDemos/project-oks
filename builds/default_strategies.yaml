@@ -1,0 +1,351 @@
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: buildah
+spec:
+  buildSteps:
+    - name: buildah-bud
+      image: quay.io/buildah/stable:latest
+      workingDir: /workspace/source
+      securityContext:
+        privileged: true
+      command:
+        - /usr/bin/buildah
+      args:
+        - bud
+        - --tag=$(build.output.image)
+        - --file=$(build.dockerfile)
+        - $(build.source.contextDir)
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+      volumeMounts:
+        - name: buildah-images
+          mountPath: /var/lib/containers/storage
+    - name: buildah-push
+      image: quay.io/buildah/stable:latest
+      securityContext:
+        privileged: true
+      command:
+        - /usr/bin/buildah
+      args:
+        - push
+        - --tls-verify=false
+        - $(build.output.image)
+        - docker://$(build.output.image)
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+      volumeMounts:
+        - name: buildah-images
+          mountPath: /var/lib/containers/storage
+
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: buildpacks-v3
+spec:
+  buildSteps:
+    - name: prepare
+      image: docker.io/paketobuildpacks/builder:full
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add: 
+            - CHOWN
+      command:
+        - /bin/bash
+      args:
+        - -c
+        - >
+          chown -R "1000:1000" /workspace/source &&
+          chown -R "1000:1000" /tekton/home &&
+          chown -R "1000:1000" /cache &&
+          chown -R "1000:1000" /layers
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+      volumeMounts:
+        - name: cache-dir
+          mountPath: /cache
+        - name: layers-dir
+          mountPath: /layers
+    - name: build-and-push
+      image: docker.io/paketobuildpacks/builder:full
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+      command:
+        - /cnb/lifecycle/creator
+      args:
+        - -app=/workspace/source/$(build.source.contextDir)
+        - -cache-dir=/cache
+        - -layers=/layers
+        - $(build.output.image)
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+      volumeMounts:
+        - name: cache-dir
+          mountPath: /cache
+        - name: layers-dir
+          mountPath: /layers
+
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: kaniko
+spec:
+  buildSteps:
+    - name: build-and-push
+      image: gcr.io/kaniko-project/executor:v1.5.2
+      workingDir: /workspace/source
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+            - SETGID
+            - SETUID
+            - SETFCAP
+            - KILL
+      env:
+        - name: DOCKER_CONFIG
+          value: /tekton/home/.docker
+        - name: AWS_ACCESS_KEY_ID
+          value: NOT_SET
+        - name: AWS_SECRET_KEY
+          value: NOT_SET
+      command:
+        - /kaniko/executor
+      args:
+        - --skip-tls-verify=true
+        - --dockerfile=$(build.dockerfile)
+        - --context=/workspace/source/$(build.source.contextDir)
+        - --destination=$(build.output.image)
+        - --oci-layout-path=/workspace/output/image
+        - --snapshotMode=redo
+        - --push-retry=3
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: source-to-image
+spec:
+  buildSteps:
+    - command:
+        - /usr/local/bin/s2i
+        - build
+        - .
+        - $(build.builder.image)
+        - '--as-dockerfile'
+        - /gen-source/Dockerfile.gen
+      image: 'quay.io/openshift-pipeline/s2i:nightly'
+      name: s2i-build-as-dockerfile
+      volumeMounts:
+        - mountPath: /gen-source
+          name: gen-source
+      workingDir: /workspace/source
+    - args:
+        - '--skip-tls-verify=true'
+        - '--dockerfile=/gen-source/Dockerfile.gen'
+        - '--context=/gen-source'
+        - '--destination=$(build.output.image)'
+        - '--oci-layout-path=/workspace/output/image'
+        - '--snapshotMode=redo'
+      command:
+        - /kaniko/executor
+      env:
+        - name: DOCKER_CONFIG
+          value: /tekton/home/.docker
+      image: gcr.io/kaniko-project/executor:v1.3.0
+      name: build-and-push
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        capabilities:
+          add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+            - SETGID
+            - SETUID
+            - SETFCAP
+      volumeMounts:
+        - mountPath: /gen-source
+          name: gen-source
+      workingDir: /gen-source
+
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: ko
+spec:
+  buildSteps:
+    - name: prepare
+      image: golang:1.15
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add: 
+            - CHOWN
+      command:
+        - /bin/bash
+      args:
+        - -c
+        - |
+          set -euo pipefail
+
+          chown -R 1000:1000 /workspace/output
+          chown -R 1000:1000 /workspace/source
+          chown -R 1000:1000 /tekton/home
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi
+        requests:
+          cpu: 100m
+          memory: 128Mi
+    - name: build-and-push
+      image: golang:1.15
+      workingDir: /workspace/source
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+      env:
+        - name: DOCKER_CONFIG
+          value: /tekton/home/.docker
+      command:
+        - /bin/bash
+      args:
+        - -c
+        - |
+          set -euo pipefail
+
+          # Parse image URL to extract repository and tag, must work with
+          # - a URL without a tag and a port: registry/image
+          # - a URL without a tag but a port: registry:port/image
+          # - a URL with a tag but without a port: registry/image:tag
+          # - a URL with both a tag and a port: registry:port/image:tag
+
+          IMAGE=$(build.output.image)
+
+          REPO=
+          TAG=
+
+          IFS=':' read -ra PARTS <<< "${IMAGE}"
+          for PART in "${PARTS[@]}"; do
+            if [ "${REPO}" == "" ]; then
+              REPO="${PART}"
+          	elif [[ "${PART}" == *"/"* ]]; then
+              REPO="${REPO}:${PART}"
+            elif [ "${TAG}" == "" ]; then
+              TAG="${PART}"
+            else
+              REPO="${REPO}:${TAG}"
+              TAG="${PART}"
+            fi
+          done
+
+          # Download ko
+          pushd /tmp > /dev/null
+            curl -f -s -L https://github.com/google/ko/releases/download/v0.8.1/ko_0.8.1_Linux_x86_64.tar.gz | tar xzf - ko
+          popd > /dev/null
+
+          # Run ko
+          if [ "${TAG}" == "" ]; then
+            GOROOT=$(go env GOROOT) KO_DOCKER_REPO="${REPO}" /tmp/ko publish "./$(build.source.contextDir)" --bare --oci-layout-path=/workspace/output/image
+          else
+            GOROOT=$(go env GOROOT) KO_DOCKER_REPO="${REPO}" /tmp/ko publish "./$(build.source.contextDir)" --bare --oci-layout-path=/workspace/output/image --tags="${TAG}"
+          fi
+      resources:
+        limits:
+          cpu: 500m
+          memory: 1Gi
+        requests:
+          cpu: 250m
+          memory: 65Mi
+
+---
+apiVersion: shipwright.io/v1alpha1
+kind: ClusterBuildStrategy
+metadata:
+  name: buildkit
+  annotations:
+    # See https://github.com/moby/buildkit/blob/master/docs/rootless.md#about---oci-worker-no-process-sandbox for more information
+    container.apparmor.security.beta.kubernetes.io/step-build-and-push: unconfined
+    # The usage of seccomp annotation will be deprecate in k8s v1.22.0, see
+    # https://kubernetes.io/docs/tutorials/clusters/seccomp/#create-a-pod-with-a-seccomp-profile-for-syscall-auditing for more information
+    container.seccomp.security.alpha.kubernetes.io/step-build-and-push: unconfined
+spec:
+  buildSteps:
+    - name: prepare
+      image: alpine:latest
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add:
+            - CHOWN
+      command:
+        - /bin/sh
+      args:
+        - -c
+        - |
+          set -exuo pipefail
+          whoami
+          chown -R 1000:1000 /tekton/home
+    - name: build-and-push
+      image: moby/buildkit:master-rootless
+      workingDir: /workspace/source/
+      env:
+      - name: DOCKER_CONFIG
+        value: /tekton/home/.docker
+      # See https://github.com/moby/buildkit/blob/master/docs/rootless.md#about---oci-worker-no-process-sandbox for more information
+      - name: BUILDKITD_FLAGS
+        value: --oci-worker-no-process-sandbox
+      command:
+        - buildctl-daemonless.sh
+      args:
+        - build
+        - --progress=plain
+        - --frontend=dockerfile.v0
+        - --local
+        - context=/workspace/source/$(build.source.contextDir)
+        - --local
+        - dockerfile=/workspace/source/$(build.dockerfile)
+        - --output
+        - type=image,name=$(build.output.image),push=true,registry.insecure=false
+        - --export-cache
+        - type=inline
+        - --import-cache
+        - type=registry,ref=$(build.output.image)
